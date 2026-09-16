@@ -52,22 +52,106 @@ def _hf_token() -> str | None:
 
 
 def _is_real_file(path: str) -> bool:
+    """Файл есть, не stub и похож на safetensors (не HTML от Drive)."""
     try:
-        return os.path.isfile(path) and os.path.getsize(path) > _MIN_REAL_BYTES
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size <= _MIN_REAL_BYTES:
+            return False
+        # LoRA/Flux обычно мегабайты; Drive virus-page HTML — килобайты текста
+        with open(path, "rb") as f:
+            head = f.read(64)
+        if not head:
+            return False
+        # HTML / JSON error pages
+        low = head.lstrip()[:20].lower()
+        if low.startswith(b"<!") or low.startswith(b"<html") or low.startswith(b"{") or low.startswith(b"<!doctype"):
+            return False
+        # safetensors: 8-byte little-endian header length
+        if path.endswith(".safetensors") and size > 8:
+            import struct
+
+            (hlen,) = struct.unpack("<Q", head[:8])
+            if hlen <= 0 or hlen > size - 8 or hlen > 100_000_000:
+                return False
+        return True
     except OSError:
         return False
 
 
+def _remove_bad_file(path: str, reason: str) -> None:
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+            print(f"[AutoDownloader] Удалён битый файл ({reason}): {path}")
+    except OSError as e:
+        print(f"[AutoDownloader] WARN remove {path}: {e}")
+
+
+def _safe_lora_filename(raw: str) -> str:
+    """Только имя файла в loras/, без путей и мусора после | / view."""
+    s = str(raw or "").strip().replace("\\", "/")
+    if not s or s in (".", ".."):
+        return ""
+    # отрезать хвост вроде sveta.safetensors/view
+    if "/" in s:
+        head = s.split("/")[0].strip()
+        if head.endswith((".safetensors", ".pt")):
+            s = head
+        else:
+            s = os.path.basename(s)
+    s = os.path.basename(s).strip()
+    if "|" in s or " " in s or ".." in s:
+        return ""
+    if not s.endswith((".safetensors", ".pt")):
+        return ""
+    return s
+
+
+def _parse_gdrive_line(line: str) -> tuple[str, str] | None:
+    """Строка `https://... | name.safetensors` → (url, filename). Битые строки → None."""
+    line = (line or "").strip()
+    if not line or line.startswith("#") or "|" not in line:
+        return None
+    parts = [p.strip() for p in line.split("|") if p.strip()]
+    if len(parts) < 2:
+        return None
+    url = parts[0]
+    if "drive.google.com" not in url and "id=" not in url:
+        return None
+    filename = ""
+    for part in parts[1:]:
+        cand = _safe_lora_filename(part)
+        if cand:
+            filename = cand
+            break
+    if not filename:
+        return None
+    return url, filename
+
+
 def _ensure_placeholder(path: str) -> bool:
     """Пустой stub, если файла нет. True = создали сейчас."""
-    if os.path.exists(path):
+    try:
+        if os.path.isfile(path):
+            return False
+        if os.path.isdir(path):
+            return False
+        parent = os.path.dirname(path)
+        if parent:
+            # если parent — уже файл (битое имя с /), не лезем в makedirs
+            if os.path.isfile(parent):
+                print(f"[AutoDownloader] WARN: parent is a file, skip stub: {path}")
+                return False
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "wb"):
+            pass
+        print(f"[AutoDownloader] Placeholder: {path}")
+        return True
+    except OSError as e:
+        print(f"[AutoDownloader] WARN placeholder {path}: {e}")
         return False
-    parent = os.path.dirname(path)
-    os.makedirs(parent, exist_ok=True)
-    with open(path, "wb"):
-        pass
-    print(f"[AutoDownloader] Placeholder: {path}")
-    return True
 
 
 def _invalidate_lora_filename_cache() -> None:
@@ -95,8 +179,9 @@ def ensure_lora_placeholders(filenames: list[str]) -> dict:
     created: list[str] = []
     existed: list[str] = []
     for raw in filenames or []:
-        name = os.path.basename(str(raw or "").strip().replace("\\", "/"))
-        if not name or name in (".", ".."):
+        name = _safe_lora_filename(raw)
+        if not name:
+            print(f"[AutoDownloader] skip bad LoRA name: {raw!r}")
             continue
         path = os.path.join(loras_dir, name)
         if _ensure_placeholder(path):
@@ -191,31 +276,21 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
     loras_dir = os.path.join(models_root, "loras")
     os.makedirs(loras_dir, exist_ok=True)
 
-    lines = (gdrive_loras_list or "").strip().split("\n")
-    pending_names: list[str] = []
-    for line in lines:
-        if "|" not in line:
+    rows: list[tuple[str, str]] = []
+    for line in (gdrive_loras_list or "").splitlines():
+        parsed = _parse_gdrive_line(line)
+        if not parsed:
+            if line.strip() and "|" in line:
+                print(f"[AutoDownloader] skip bad line: {line.strip()[:120]}")
             continue
-        _url_part, filename_part = line.split("|", 1)
-        filename = filename_part.strip()
-        if filename:
-            pending_names.append(filename)
+        rows.append(parsed)
 
-    stubs = ensure_lora_placeholders(pending_names)
+    stubs = ensure_lora_placeholders([fn for _url, fn in rows])
     downloaded: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
 
-    for line in lines:
-        if "|" not in line:
-            continue
-
-        url_part, filename_part = line.split("|", 1)
-        url = url_part.strip()
-        filename = filename_part.strip()
-        if not url or not filename:
-            continue
-
+    for url, filename in rows:
         target_path = os.path.join(loras_dir, filename)
 
         if _is_real_file(target_path):
@@ -240,19 +315,19 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
             continue
 
         if os.path.isfile(target_path) and not _is_real_file(target_path):
-            try:
-                os.remove(target_path)
-            except OSError:
-                pass
+            _remove_bad_file(target_path, "stub or invalid before download")
 
-        direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        direct_url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
         cmd = (
             f"aria2c --max-connection-per-server=16 -x16 -s16 --continue=true "
+            f"--allow-overwrite=true --auto-file-renaming=false "
             f"-o '{filename}' -d '{loras_dir}' '{direct_url}'"
         )
         rc = os.system(cmd)
         if rc != 0 or not _is_real_file(target_path):
             print(f"[AutoDownloader] WARN: скачивание LoRA не подтверждено: {filename}")
+            if os.path.isfile(target_path) and not _is_real_file(target_path):
+                _remove_bad_file(target_path, "failed download / HTML")
             errors.append(f"{filename}: download failed")
             _ensure_placeholder(target_path)
         else:
@@ -282,6 +357,76 @@ if _extra:
         print(f"[AutoDownloader] WARN env placeholders: {e}")
 
 
+_BASE_DOWNLOAD_STATE: dict = {
+    "running": False,
+    "last": None,
+}
+
+
+def base_models_status() -> dict:
+    """Размеры базовых файлов Flux на диске (для poll с бэкенда)."""
+    models_root = _models_root()
+    files = []
+    ready = 0
+    for item in _BASE_MODEL_SPECS:
+        path = os.path.join(models_root, item["folder"], item["file"])
+        size = 0
+        exists = os.path.isfile(path)
+        if exists:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+        is_real = _is_real_file(path)
+        if is_real:
+            ready += 1
+        files.append(
+            {
+                "file": item["file"],
+                "folder": item["folder"],
+                "path": path,
+                "exists": exists,
+                "bytes": size,
+                "ready": is_real,
+            }
+        )
+    return {
+        "ok": ready == len(_BASE_MODEL_SPECS),
+        "ready": ready,
+        "total": len(_BASE_MODEL_SPECS),
+        "files": files,
+        "download_running": bool(_BASE_DOWNLOAD_STATE.get("running")),
+        "last": _BASE_DOWNLOAD_STATE.get("last"),
+    }
+
+
+def start_base_models_download_background() -> dict:
+    """Старт HF-скачивания в фоне — proxy RunPod не режет длинный HTTP."""
+    import threading
+
+    if _BASE_DOWNLOAD_STATE.get("running"):
+        return {
+            "ok": True,
+            "started": False,
+            "already_running": True,
+            "status": base_models_status(),
+        }
+
+    def _worker() -> None:
+        _BASE_DOWNLOAD_STATE["running"] = True
+        try:
+            result = download_base_models_now()
+            _BASE_DOWNLOAD_STATE["last"] = result
+        except Exception as e:  # pragma: no cover
+            _BASE_DOWNLOAD_STATE["last"] = {"ok": False, "error": str(e)}
+            print(f"[AutoDownloader] background base download error: {e}")
+        finally:
+            _BASE_DOWNLOAD_STATE["running"] = False
+
+    threading.Thread(target=_worker, name="flux-base-download", daemon=True).start()
+    return {"ok": True, "started": True, "already_running": False, "status": base_models_status()}
+
+
 def _register_http_routes() -> None:
     """HTTP для Boot из мониторинга (без Queue workflow)."""
     try:
@@ -306,9 +451,27 @@ def _register_http_routes() -> None:
         return web.json_response(result)
 
     @routes.post("/flux_auto_downloader/download_base")
-    async def download_base_handler(_request):
-        result = await asyncio.to_thread(download_base_models_now)
+    async def download_base_handler(request):
+        # ?sync=1 — старое блокирующее поведение; по умолчанию фон (прокси не 502)
+        sync = False
+        try:
+            if request.rel_url.query.get("sync") in ("1", "true", "yes"):
+                sync = True
+            else:
+                data = await request.json()
+                if isinstance(data, dict) and data.get("sync"):
+                    sync = True
+        except Exception:
+            pass
+        if sync:
+            result = await asyncio.to_thread(download_base_models_now)
+            return web.json_response(result)
+        result = await asyncio.to_thread(start_base_models_download_background)
         return web.json_response(result)
+
+    @routes.get("/flux_auto_downloader/download_base_status")
+    async def download_base_status_handler(_request):
+        return web.json_response(base_models_status())
 
     @routes.post("/flux_auto_downloader/download_loras")
     async def download_loras_handler(request):
@@ -325,7 +488,8 @@ def _register_http_routes() -> None:
     print(
         "[AutoDownloader] HTTP: "
         "POST /flux_auto_downloader/ensure_placeholders | "
-        "download_base | download_loras"
+        "download_base | download_loras | "
+        "GET download_base_status"
     )
 
 
@@ -344,7 +508,7 @@ class FluxAutoDownloaderNode:
                     "STRING",
                     {
                         "multiline": True,
-                        "default": "https://drive.google.com/file/d/.../view | lora_name.safetensors",
+                        "default": "",
                     },
                 ),
                 "trigger": ("MODEL",),
