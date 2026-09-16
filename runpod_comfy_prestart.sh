@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# RunPod template wrapper for runpod/comfyui.
+# RunPod PID1 wrapper for runpod/comfyui (template uwflr4zwaj).
 #
-# Важно про этот образ:
-# - ENTRYPOINT обычно /start.sh. Одно поле «Container Start Command» часто
-#   только подменяет CMD → наш curl игнорируется, Comfy стартует без ноды.
-# - На первом буте custom_nodes в /workspace появляется ТОЛЬКО после того,
-#   как /start.sh скопирует bake. Ждать workspace ДО /start.sh = бессмысленно.
-#   Ставим ноду в bake (если есть) и/или в уже существующий workspace, потом exec /start.sh.
+# Образ: ENTRYPOINT=/start.sh. Одно поле CMD часто игнорируется.
+# В шаблоне RunPod нужен JSON с переопределением entrypoint:
 #
-# В шаблоне RunPod предпочтительно JSON (entrypoint + cmd), иначе Start Command не выполнится:
-#   {"entrypoint":["/bin/bash","-lc"],"cmd":["curl -fsSL https://raw.githubusercontent.com/boroda4biz-sys/flux_auto_downloader/main/runpod_comfy_prestart.sh | bash"]}
+#   {"entrypoint":["/bin/bash","-c"],"cmd":["curl -fsSL https://raw.githubusercontent.com/boroda4biz-sys/flux_auto_downloader/main/runpod_comfy_prestart.sh | bash"]}
 #
-# Либо Entrypoint = /bin/bash и Start Command =
-#   -lc "curl -fsSL https://raw.githubusercontent.com/boroda4biz-sys/flux_auto_downloader/main/runpod_comfy_prestart.sh | bash"
+# Bake path (из start.sh образа): cp -r /opt/comfyui-baked → /workspace/runpod-slim/ComfyUI
+# Значит ноду кладём в /opt/comfyui-baked/custom_nodes ДО exec /start.sh.
+#
+# MATRIX_INSTALL_ONLY=1 — только clone, без exec /start.sh (для ручных хуков; не для sed-рекурсии).
 
 set -euo pipefail
 
 REPO_URL="${FLUX_AUTO_DOWNLOADER_REPO:-https://github.com/boroda4biz-sys/flux_auto_downloader.git}"
 ORIG_ENTRY="${RUNPOD_ORIG_ENTRY:-/start.sh}"
 COMFY_ROOT="${COMFY_ROOT:-/workspace/runpod-slim/ComfyUI}"
+BAKED_ROOT="${BAKED_COMFYUI_DIR:-/opt/comfyui-baked}"
+INSTALL_ONLY="${MATRIX_INSTALL_ONLY:-0}"
 
 install_into() {
   local nodes_dir="$1"
@@ -49,32 +48,31 @@ install_into() {
   return 1
 }
 
-echo "[matrix-prestart] begin"
+echo "[matrix-prestart] begin pid=$$ INSTALL_ONLY=${INSTALL_ONLY}"
 
 installed=0
 
-# 1) Bake image copy source — на первом буте /start.sh копирует это в /workspace
-for bake_nodes in \
-  /opt/comfyui-baked/ComfyUI/custom_nodes \
-  /opt/ComfyUI/custom_nodes \
-  /ComfyUI/custom_nodes
-do
-  if [[ -d "$(dirname "${bake_nodes}")" ]] || [[ -d "${bake_nodes}" ]]; then
-    if install_into "${bake_nodes}"; then
-      installed=1
-    fi
+# 1) Bake = корень ComfyUI в образе (НЕ .../ComfyUI/ComfyUI)
+if [[ -d "${BAKED_ROOT}" ]]; then
+  if install_into "${BAKED_ROOT}/custom_nodes"; then
+    installed=1
   fi
-done
+fi
 
-# 2) Уже распакованный workspace (рестарт пода / volume)
-if [[ -d "${COMFY_ROOT}/custom_nodes" ]] || [[ -d "${COMFY_ROOT}" ]]; then
+# 2) Workspace уже есть (рестарт / volume)
+if [[ -d "${COMFY_ROOT}" ]] || [[ -d "${COMFY_ROOT}/custom_nodes" ]]; then
   if install_into "${COMFY_ROOT}/custom_nodes"; then
     installed=1
   fi
 fi
 
 if [[ "${installed}" -eq 0 ]]; then
-  echo "[matrix-prestart] WARN: no bake/workspace Comfy yet — will rely on /start.sh copy, node may be missing on first attempt"
+  echo "[matrix-prestart] WARN: neither ${BAKED_ROOT} nor ${COMFY_ROOT} ready"
+fi
+
+if [[ "${INSTALL_ONLY}" == "1" ]]; then
+  echo "[matrix-prestart] install-only done"
+  exit 0
 fi
 
 if [[ -x "${ORIG_ENTRY}" ]]; then
