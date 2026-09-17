@@ -112,8 +112,81 @@ def _safe_lora_filename(raw: str) -> str:
     return s
 
 
-def _parse_gdrive_line(line: str) -> tuple[str, str] | None:
-    """Строка `https://... | name.safetensors` → (url, filename). Битые строки → None."""
+def _is_hf_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return (
+        u.startswith("hf://")
+        or "huggingface.co/" in u
+        or "hf.co/" in u
+    )
+
+
+def _is_gdrive_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    return "drive.google.com" in u or ("id=" in u and "google" in u)
+
+
+def _parse_hf_repo_and_file(url: str, filename_hint: str = "") -> tuple[str, str] | None:
+    """
+    HF URL → (repo_id, filename_in_repo).
+    Примеры:
+      hf://user/repo/mtxcomic.safetensors
+      https://huggingface.co/user/repo/resolve/main/mtxcomic.safetensors
+      https://huggingface.co/user/repo/blob/main/foo/mtxcomic.safetensors
+      https://huggingface.co/user/repo  (+ hint filename)
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    hint = _safe_lora_filename(filename_hint) or ""
+
+    if raw.lower().startswith("hf://"):
+        body = raw[5:].strip().strip("/")
+        parts = [p for p in body.split("/") if p]
+        if len(parts) < 2:
+            return None
+        repo_id = f"{parts[0]}/{parts[1]}"
+        if len(parts) >= 3:
+            return repo_id, "/".join(parts[2:])
+        if hint:
+            return repo_id, hint
+        return None
+
+    # strip query
+    path = raw.split("?", 1)[0]
+    for host in ("https://huggingface.co/", "http://huggingface.co/", "https://hf.co/", "http://hf.co/"):
+        if path.lower().startswith(host):
+            path = path[len(host) :]
+            break
+    else:
+        if "huggingface.co/" in path.lower():
+            path = path.lower().split("huggingface.co/", 1)[1]
+        elif "hf.co/" in path.lower():
+            path = path.lower().split("hf.co/", 1)[1]
+        else:
+            return None
+
+    parts = [p for p in path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    repo_id = f"{parts[0]}/{parts[1]}"
+    rest = parts[2:]
+    if rest and rest[0] in ("resolve", "blob", "raw"):
+        # resolve/main/file or blob/main/path/file
+        if len(rest) >= 3:
+            return repo_id, "/".join(rest[2:])
+        if hint:
+            return repo_id, hint
+        return None
+    if rest:
+        return repo_id, "/".join(rest)
+    if hint:
+        return repo_id, hint
+    return None
+
+
+def _parse_lora_source_line(line: str) -> tuple[str, str] | None:
+    """Строка `url | name.safetensors` → (url, filename). Drive или Hugging Face."""
     line = (line or "").strip()
     if not line or line.startswith("#") or "|" not in line:
         return None
@@ -121,8 +194,6 @@ def _parse_gdrive_line(line: str) -> tuple[str, str] | None:
     if len(parts) < 2:
         return None
     url = parts[0]
-    if "drive.google.com" not in url and "id=" not in url:
-        return None
     filename = ""
     for part in parts[1:]:
         cand = _safe_lora_filename(part)
@@ -131,7 +202,91 @@ def _parse_gdrive_line(line: str) -> tuple[str, str] | None:
             break
     if not filename:
         return None
+    if not (_is_hf_url(url) or _is_gdrive_url(url)):
+        return None
     return url, filename
+
+
+# backward alias
+_parse_gdrive_line = _parse_lora_source_line
+
+
+def _download_hf_lora(url: str, filename: str, loras_dir: str) -> tuple[bool, str]:
+    """Скачать LoRA с HF (нужен HF_TOKEN для private). Возвращает (ok, error)."""
+    if hf_hub_download is None:
+        return False, "huggingface_hub не установлен на поде"
+    token = _hf_token()
+    parsed = _parse_hf_repo_and_file(url, filename)
+    if not parsed:
+        return False, f"не разобрал HF URL: {url}"
+    repo_id, repo_file = parsed
+    target_path = os.path.join(loras_dir, filename)
+    print(f"[AutoDownloader] HF LoRA {filename} ← {repo_id}/{repo_file}")
+    try:
+        got = hf_hub_download(
+            repo_id=repo_id,
+            filename=repo_file,
+            local_dir=loras_dir,
+            token=token,
+        )
+        # hub может положить с подпутём — привести к models/loras/filename
+        if got and os.path.isfile(got):
+            abs_got = os.path.abspath(got)
+            abs_tgt = os.path.abspath(target_path)
+            if abs_got != abs_tgt:
+                os.makedirs(loras_dir, exist_ok=True)
+                if os.path.isfile(target_path):
+                    try:
+                        os.remove(target_path)
+                    except OSError:
+                        pass
+                os.replace(got, target_path)
+        if _is_real_file(target_path):
+            return True, ""
+        return False, "файл после HF download не похож на safetensors"
+    except Exception as e:
+        return False, str(e)
+
+
+def _download_gdrive_lora(url: str, filename: str, loras_dir: str) -> tuple[bool, str]:
+    """Скачать LoRA с Google Drive через aria2. Возвращает (ok, error)."""
+    target_path = os.path.join(loras_dir, filename)
+    if "/folders/" in url or "/drive/folders/" in url:
+        return False, (
+            f"это ссылка на ПАПКУ Drive, нужна ссылка на ФАЙЛ "
+            f"(.safetensors): …/file/d/ID/view — сейчас: {url}"
+        )
+    file_id = None
+    if "/d/" in url:
+        file_id = url.split("/d/")[1].split("/")[0]
+    elif "id=" in url:
+        file_id = url.split("id=")[1].split("&")[0]
+    if not file_id or file_id.startswith("folders"):
+        return False, f"Не разобрал Drive FILE id (нужен /file/d/…): {url}"
+
+    direct_url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
+    cmd = (
+        f"aria2c --max-connection-per-server=16 -x16 -s16 --continue=true "
+        f"--allow-overwrite=true --auto-file-renaming=false "
+        f"-o '{filename}' -d '{loras_dir}' '{direct_url}'"
+    )
+    rc = os.system(cmd)
+    if rc != 0 or not _is_real_file(target_path):
+        sniff = ""
+        try:
+            if os.path.isfile(target_path):
+                with open(target_path, "rb") as f:
+                    sniff = f.read(40).lstrip()[:20].lower().decode("latin-1", "ignore")
+        except OSError:
+            pass
+        why = "HTML/virus-scan Drive" if sniff.startswith("<!") or sniff.startswith("<html") else "invalid"
+        if os.path.isfile(target_path):
+            _remove_bad_file(target_path, f"failed download / {why}")
+        return False, (
+            f"скачивание не дало настоящий .safetensors ({why}); "
+            f"для файлов >~100МБ лучше Hugging Face URL + HF_TOKEN"
+        )
+    return True, ""
 
 
 def _ensure_placeholder(path: str) -> bool:
@@ -273,7 +428,7 @@ def download_base_models_now() -> dict:
 
 
 def download_loras_from_list(gdrive_loras_list: str) -> dict:
-    """Скачать LoRA с Google Drive по строкам `url | filename`."""
+    """Скачать LoRA по строкам `url | filename` — Google Drive или Hugging Face."""
     _ensure_aria2()
     models_root = _models_root()
     loras_dir = os.path.join(models_root, "loras")
@@ -281,7 +436,7 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
 
     rows: list[tuple[str, str]] = []
     for line in (gdrive_loras_list or "").splitlines():
-        parsed = _parse_gdrive_line(line)
+        parsed = _parse_lora_source_line(line)
         if not parsed:
             if line.strip() and "|" in line:
                 print(f"[AutoDownloader] skip bad line: {line.strip()[:120]}")
@@ -305,55 +460,23 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
             f"[AutoDownloader] Обнаружена заглушка или файл отсутствует, качаем: {filename}"
         )
 
-        file_id = None
-        if "/folders/" in url or "/drive/folders/" in url:
-            msg = (
-                f"это ссылка на ПАПКУ Drive, нужна ссылка на ФАЙЛ "
-                f"(.safetensors): …/file/d/ID/view — сейчас: {url}"
-            )
-            print(f"[AutoDownloader] {msg}")
-            errors.append(f"{filename}: {msg}")
-            continue
-        if "/d/" in url:
-            file_id = url.split("/d/")[1].split("/")[0]
-        elif "id=" in url:
-            file_id = url.split("id=")[1].split("&")[0]
-
-        if not file_id or file_id.startswith("folders"):
-            msg = f"Не разобрал Drive FILE id (нужен /file/d/…): {url}"
-            print(f"[AutoDownloader] {msg}")
-            errors.append(f"{filename}: {msg}")
-            continue
-
         if os.path.isfile(target_path) and not _is_real_file(target_path):
             _remove_bad_file(target_path, "stub or invalid before download")
 
-        direct_url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
-        cmd = (
-            f"aria2c --max-connection-per-server=16 -x16 -s16 --continue=true "
-            f"--allow-overwrite=true --auto-file-renaming=false "
-            f"-o '{filename}' -d '{loras_dir}' '{direct_url}'"
-        )
-        rc = os.system(cmd)
-        if rc != 0 or not _is_real_file(target_path):
-            print(f"[AutoDownloader] WARN: скачивание LoRA не подтверждено: {filename}")
-            if os.path.isfile(target_path):
-                # часто HTML «логин Google» ~0.5–2 МБ — не оставляем под LoraLoader
-                sniff = ""
-                try:
-                    with open(target_path, "rb") as f:
-                        sniff = f.read(40).lstrip()[:20].lower().decode("latin-1", "ignore")
-                except OSError:
-                    pass
-                why = "HTML/логин Drive" if sniff.startswith("<!") or sniff.startswith("<html") else "invalid"
-                _remove_bad_file(target_path, f"failed download / {why}")
-            errors.append(
-                f"{filename}: скачивание не дало настоящий .safetensors "
-                f"(проверь «доступ по ссылке» на файл, не папку; в инкогнито должно качаться без логина)"
-            )
-            # НЕ ставим placeholder — иначе LoraLoader → JSONDecodeError
+        if _is_hf_url(url):
+            ok, err = _download_hf_lora(url, filename, loras_dir)
+        elif _is_gdrive_url(url):
+            ok, err = _download_gdrive_lora(url, filename, loras_dir)
         else:
+            ok, err = False, f"неизвестный источник (нужен Drive или Hugging Face): {url}"
+
+        if ok:
             downloaded.append(filename)
+            print(f"[AutoDownloader] OK LoRA: {filename}")
+        else:
+            print(f"[AutoDownloader] WARN LoRA {filename}: {err}")
+            errors.append(f"{filename}: {err}")
+            # НЕ ставим placeholder — иначе LoraLoader → JSONDecodeError
 
     return {
         "ok": len(errors) == 0,
