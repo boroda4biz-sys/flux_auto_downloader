@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RunPod PID1 wrapper for runpod/comfyui (template uwflr4zwaj).
+# RunPod PID1 wrapper for runpod/comfyui (template lb3vvlinnd).
 #
 # Образ: ENTRYPOINT=/start.sh. Одно поле CMD часто игнорируется.
 # В шаблоне RunPod нужен JSON с переопределением entrypoint:
@@ -26,22 +26,19 @@ install_into() {
   mkdir -p "${nodes_dir}"
   echo "[matrix-prestart] ensuring node in ${node_dir}"
 
-  if [[ -d "${node_dir}/.git" ]]; then
-    git -C "${node_dir}" fetch --depth 1 origin main 2>/dev/null \
-      || git -C "${node_dir}" fetch --depth 1 origin master 2>/dev/null \
-      || true
-    git -C "${node_dir}" reset --hard FETCH_HEAD 2>/dev/null \
-      || git -C "${node_dir}" pull --ff-only \
-      || true
-  elif [[ -d "${node_dir}" ]]; then
+  # Всегда свежий clone — иначе volume/bake держит ноду без HF-скачивания LoRA
+  if [[ -d "${node_dir}" ]]; then
+    echo "[matrix-prestart] removing old ${node_dir}"
     rm -rf "${node_dir}"
-    git clone --depth 1 "${REPO_URL}" "${node_dir}"
-  else
-    git clone --depth 1 "${REPO_URL}" "${node_dir}"
   fi
+  git clone --depth 1 "${REPO_URL}" "${node_dir}"
 
   if [[ -f "${node_dir}/__init__.py" ]]; then
-    echo "[matrix-prestart] OK: ${node_dir}/__init__.py"
+    if grep -q "_is_hf_url" "${node_dir}/__init__.py" 2>/dev/null; then
+      echo "[matrix-prestart] OK: ${node_dir}/__init__.py (HF LoRA support)"
+    else
+      echo "[matrix-prestart] WARN: __init__.py без _is_hf_url — устаревший репозиторий?"
+    fi
     return 0
   fi
   echo "[matrix-prestart] ERROR: __init__.py missing in ${node_dir}"
