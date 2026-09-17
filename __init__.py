@@ -212,40 +212,113 @@ _parse_gdrive_line = _parse_lora_source_line
 
 
 def _download_hf_lora(url: str, filename: str, loras_dir: str) -> tuple[bool, str]:
-    """Скачать LoRA с HF (нужен HF_TOKEN для private). Возвращает (ok, error)."""
-    if hf_hub_download is None:
-        return False, "huggingface_hub не установлен на поде"
+    """Скачать LoRA с HF (stream + прогресс в _LORA_DOWNLOAD_STATE)."""
     token = _hf_token()
     parsed = _parse_hf_repo_and_file(url, filename)
     if not parsed:
         return False, f"не разобрал HF URL: {url}"
     repo_id, repo_file = parsed
     target_path = os.path.join(loras_dir, filename)
+    os.makedirs(loras_dir, exist_ok=True)
     print(f"[AutoDownloader] HF LoRA {filename} ← {repo_id}/{repo_file}")
+
+    # Прямой resolve URL — стрим с прогрессом (понятнее, чем тихий hf_hub_download)
+    resolve_url = url.strip()
+    if "resolve/" not in resolve_url.lower():
+        resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{repo_file}"
+
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
-        got = hf_hub_download(
-            repo_id=repo_id,
-            filename=repo_file,
-            local_dir=loras_dir,
-            token=token,
-        )
-        # hub может положить с подпутём — привести к models/loras/filename
-        if got and os.path.isfile(got):
-            abs_got = os.path.abspath(got)
-            abs_tgt = os.path.abspath(target_path)
-            if abs_got != abs_tgt:
-                os.makedirs(loras_dir, exist_ok=True)
-                if os.path.isfile(target_path):
-                    try:
-                        os.remove(target_path)
-                    except OSError:
-                        pass
-                os.replace(got, target_path)
+        import urllib.request
+
+        req = urllib.request.Request(resolve_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = 0
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            _set_lora_progress(
+                filename=filename, current_bytes=0, total_bytes=total, message=""
+            )
+            tmp_path = target_path + ".part"
+            written = 0
+            last_report = 0
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                    if written - last_report >= 2 * 1024 * 1024 or written == total:
+                        last_report = written
+                        _set_lora_progress(
+                            filename=filename,
+                            current_bytes=written,
+                            total_bytes=total,
+                        )
+                        print(
+                            f"[AutoDownloader] HF {filename}: {_fmt_bytes(written)}"
+                            + (f" / {_fmt_bytes(total)}" if total else "")
+                        )
+            if os.path.isfile(target_path):
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+            os.replace(tmp_path, target_path)
+
         if _is_real_file(target_path):
+            _set_lora_progress(
+                filename=filename,
+                current_bytes=os.path.getsize(target_path),
+                total_bytes=os.path.getsize(target_path),
+                message=f"{filename}: готово",
+            )
             return True, ""
         return False, "файл после HF download не похож на safetensors"
     except Exception as e:
-        return False, str(e)
+        # fallback: huggingface_hub (без побайтового прогресса в файл)
+        if hf_hub_download is None:
+            return False, str(e)
+        print(f"[AutoDownloader] HF stream fail ({e}) — fallback hf_hub_download")
+        try:
+            _set_lora_progress(
+                filename=filename,
+                message=f"{filename}: hf_hub_download…",
+            )
+            got = hf_hub_download(
+                repo_id=repo_id,
+                filename=repo_file,
+                local_dir=loras_dir,
+                token=token,
+            )
+            if got and os.path.isfile(got):
+                abs_got = os.path.abspath(got)
+                abs_tgt = os.path.abspath(target_path)
+                if abs_got != abs_tgt:
+                    if os.path.isfile(target_path):
+                        try:
+                            os.remove(target_path)
+                        except OSError:
+                            pass
+                    os.replace(got, target_path)
+            if _is_real_file(target_path):
+                sz = os.path.getsize(target_path)
+                _set_lora_progress(
+                    filename=filename,
+                    current_bytes=sz,
+                    total_bytes=sz,
+                    message=f"{filename}: готово",
+                )
+                return True, ""
+            return False, "файл после HF download не похож на safetensors"
+        except Exception as e2:
+            return False, str(e2)
 
 
 def _download_gdrive_lora(url: str, filename: str, loras_dir: str) -> tuple[bool, str]:
@@ -265,12 +338,36 @@ def _download_gdrive_lora(url: str, filename: str, loras_dir: str) -> tuple[bool
         return False, f"Не разобрал Drive FILE id (нужен /file/d/…): {url}"
 
     direct_url = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
+    _set_lora_progress(filename=filename, message=f"{filename}: aria2 Drive…")
     cmd = (
         f"aria2c --max-connection-per-server=16 -x16 -s16 --continue=true "
         f"--allow-overwrite=true --auto-file-renaming=false "
         f"-o '{filename}' -d '{loras_dir}' '{direct_url}'"
     )
-    rc = os.system(cmd)
+    # фоновый монитор размера файла пока крутится aria2
+    import subprocess
+    import threading
+    import time
+
+    stop_mon = threading.Event()
+
+    def _mon() -> None:
+        while not stop_mon.wait(1.5):
+            try:
+                if os.path.isfile(target_path):
+                    sz = os.path.getsize(target_path)
+                    _set_lora_progress(filename=filename, current_bytes=sz)
+            except OSError:
+                pass
+
+    mon = threading.Thread(target=_mon, name="aria2-size", daemon=True)
+    mon.start()
+    try:
+        rc = subprocess.call(cmd, shell=True)
+    finally:
+        stop_mon.set()
+        mon.join(timeout=2)
+
     if rc != 0 or not _is_real_file(target_path):
         sniff = ""
         try:
@@ -286,6 +383,13 @@ def _download_gdrive_lora(url: str, filename: str, loras_dir: str) -> tuple[bool
             f"скачивание не дало настоящий .safetensors ({why}); "
             f"для файлов >~100МБ лучше Hugging Face URL + HF_TOKEN"
         )
+    sz = os.path.getsize(target_path)
+    _set_lora_progress(
+        filename=filename,
+        current_bytes=sz,
+        total_bytes=sz,
+        message=f"{filename}: готово",
+    )
     return True, ""
 
 
@@ -459,6 +563,7 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
         print(
             f"[AutoDownloader] Обнаружена заглушка или файл отсутствует, качаем: {filename}"
         )
+        _set_lora_progress(filename=filename, message=f"качаем {filename}…")
 
         if os.path.isfile(target_path) and not _is_real_file(target_path):
             _remove_bad_file(target_path, "stub or invalid before download")
@@ -487,6 +592,50 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
     }
 
 
+def start_loras_download_background(gdrive_loras_list: str) -> dict:
+    """Фоновое скачивание LoRA — proxy не режет длинный HTTP; статус через GET."""
+    import threading
+
+    if _LORA_DOWNLOAD_STATE.get("running"):
+        return {
+            "ok": True,
+            "started": False,
+            "already_running": True,
+            "status": loras_status(),
+        }
+
+    text = gdrive_loras_list or ""
+
+    def _worker() -> None:
+        _LORA_DOWNLOAD_STATE["running"] = True
+        _LORA_DOWNLOAD_STATE["message"] = "старт скачивания LoRA…"
+        try:
+            result = download_loras_from_list(text)
+            _LORA_DOWNLOAD_STATE["last"] = result
+            _LORA_DOWNLOAD_STATE["message"] = (
+                "готово" if result.get("ok") else f"ошибки: {result.get('errors')}"
+            )
+        except Exception as e:  # pragma: no cover
+            _LORA_DOWNLOAD_STATE["last"] = {"ok": False, "error": str(e)}
+            _LORA_DOWNLOAD_STATE["message"] = str(e)
+            print(f"[AutoDownloader] background LoRA download error: {e}")
+        finally:
+            _LORA_DOWNLOAD_STATE["running"] = False
+
+    threading.Thread(target=_worker, name="flux-lora-download", daemon=True).start()
+    names = []
+    for line in text.splitlines():
+        parsed = _parse_lora_source_line(line)
+        if parsed:
+            names.append(parsed[1])
+    return {
+        "ok": True,
+        "started": True,
+        "already_running": False,
+        "status": loras_status(names or None),
+    }
+
+
 try:
     ensure_base_model_placeholders()
 except Exception as e:  # pragma: no cover
@@ -506,6 +655,53 @@ _BASE_DOWNLOAD_STATE: dict = {
     "running": False,
     "last": None,
 }
+
+_LORA_DOWNLOAD_STATE: dict = {
+    "running": False,
+    "last": None,
+    "current_file": "",
+    "current_bytes": 0,
+    "total_bytes": 0,
+    "message": "",
+}
+
+
+def _fmt_bytes(n: int | float) -> str:
+    try:
+        b = float(n)
+    except (TypeError, ValueError):
+        return "0 B"
+    if b < 1024:
+        return f"{int(b)} B"
+    if b < 1024 * 1024:
+        return f"{b / 1024:.1f} KB"
+    if b < 1024 * 1024 * 1024:
+        return f"{b / (1024 * 1024):.1f} MB"
+    return f"{b / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _set_lora_progress(
+    *,
+    filename: str = "",
+    current_bytes: int = 0,
+    total_bytes: int = 0,
+    message: str = "",
+) -> None:
+    _LORA_DOWNLOAD_STATE["current_file"] = filename or ""
+    _LORA_DOWNLOAD_STATE["current_bytes"] = int(current_bytes or 0)
+    _LORA_DOWNLOAD_STATE["total_bytes"] = int(total_bytes or 0)
+    if message:
+        _LORA_DOWNLOAD_STATE["message"] = message
+    elif filename:
+        tot = int(total_bytes or 0)
+        cur = int(current_bytes or 0)
+        if tot > 0:
+            pct = min(100.0, 100.0 * cur / tot)
+            _LORA_DOWNLOAD_STATE["message"] = (
+                f"{filename}: {_fmt_bytes(cur)} / {_fmt_bytes(tot)} ({pct:.0f}%)"
+            )
+        else:
+            _LORA_DOWNLOAD_STATE["message"] = f"{filename}: {_fmt_bytes(cur)}"
 
 
 def loras_status(filenames: list[str] | None = None) -> dict:
@@ -528,6 +724,14 @@ def loras_status(filenames: list[str] | None = None) -> dict:
                 size = os.path.getsize(path)
             except OSError:
                 size = 0
+        # aria2 partial рядом
+        for suffix in (".aria2", ".tmp", ".part"):
+            p2 = path + suffix
+            if os.path.isfile(p2):
+                try:
+                    size = max(size, os.path.getsize(p2))
+                except OSError:
+                    pass
         is_real = _is_real_file(path)
         if is_real:
             ready += 1
@@ -537,14 +741,24 @@ def loras_status(filenames: list[str] | None = None) -> dict:
                 "exists": exists,
                 "bytes": size,
                 "ready": is_real,
+                "human": _fmt_bytes(size),
             }
         )
+    cur = str(_LORA_DOWNLOAD_STATE.get("current_file") or "")
+    cur_b = int(_LORA_DOWNLOAD_STATE.get("current_bytes") or 0)
+    tot_b = int(_LORA_DOWNLOAD_STATE.get("total_bytes") or 0)
     return {
         "ok": bool(names) and ready == len(names),
         "ready": ready,
         "total": len(names),
         "files": files,
         "loras_dir": loras_dir,
+        "download_running": bool(_LORA_DOWNLOAD_STATE.get("running")),
+        "current_file": cur,
+        "current_bytes": cur_b,
+        "total_bytes": tot_b,
+        "message": str(_LORA_DOWNLOAD_STATE.get("message") or ""),
+        "last": _LORA_DOWNLOAD_STATE.get("last"),
     }
 
 
@@ -573,6 +787,7 @@ def base_models_status() -> dict:
                 "exists": exists,
                 "bytes": size,
                 "ready": is_real,
+                "human": _fmt_bytes(size),
             }
         )
     return {
@@ -582,7 +797,22 @@ def base_models_status() -> dict:
         "files": files,
         "download_running": bool(_BASE_DOWNLOAD_STATE.get("running")),
         "last": _BASE_DOWNLOAD_STATE.get("last"),
+        "message": _format_files_progress(files, ready, len(_BASE_MODEL_SPECS), "Flux"),
     }
+
+
+def _format_files_progress(files: list, ready: int, total: int, label: str) -> str:
+    bits = []
+    for f in files or []:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("file") or "")
+        if f.get("ready"):
+            bits.append(f"{name} ✓ {_fmt_bytes(f.get('bytes') or 0)}")
+        else:
+            bits.append(f"{name} {_fmt_bytes(f.get('bytes') or 0)}")
+    detail = " · ".join(bits[:4])
+    return f"{label} {ready}/{total}" + (f" · {detail}" if detail else "")
 
 
 def start_base_models_download_background() -> dict:
@@ -664,6 +894,12 @@ def _register_http_routes() -> None:
         names = [p.strip() for p in files_q.split(",") if p.strip()]
         return web.json_response(loras_status(names or None))
 
+    @routes.get("/flux_auto_downloader/download_loras_status")
+    async def download_loras_status_handler(request):
+        files_q = request.rel_url.query.get("files") or ""
+        names = [p.strip() for p in files_q.split(",") if p.strip()]
+        return web.json_response(loras_status(names or None))
+
     @routes.post("/flux_auto_downloader/download_loras")
     async def download_loras_handler(request):
         try:
@@ -671,16 +907,23 @@ def _register_http_routes() -> None:
         except Exception:
             data = {}
         gdrive_list = ""
+        sync = False
         if isinstance(data, dict):
             gdrive_list = str(data.get("gdrive_loras_list") or data.get("list") or "")
-        result = await asyncio.to_thread(download_loras_from_list, gdrive_list)
+            sync = bool(data.get("sync"))
+        if request.rel_url.query.get("sync") in ("1", "true", "yes"):
+            sync = True
+        if sync:
+            result = await asyncio.to_thread(download_loras_from_list, gdrive_list)
+            return web.json_response(result)
+        result = await asyncio.to_thread(start_loras_download_background, gdrive_list)
         return web.json_response(result)
 
     print(
         "[AutoDownloader] HTTP: "
         "POST /flux_auto_downloader/ensure_placeholders | "
         "download_base | download_loras | "
-        "GET download_base_status | loras_status"
+        "GET download_base_status | loras_status | download_loras_status"
     )
 
 
