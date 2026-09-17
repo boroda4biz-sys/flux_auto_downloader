@@ -303,13 +303,21 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
         )
 
         file_id = None
+        if "/folders/" in url or "/drive/folders/" in url:
+            msg = (
+                f"это ссылка на ПАПКУ Drive, нужна ссылка на ФАЙЛ "
+                f"(.safetensors): …/file/d/ID/view — сейчас: {url}"
+            )
+            print(f"[AutoDownloader] {msg}")
+            errors.append(f"{filename}: {msg}")
+            continue
         if "/d/" in url:
             file_id = url.split("/d/")[1].split("/")[0]
         elif "id=" in url:
             file_id = url.split("id=")[1].split("&")[0]
 
-        if not file_id:
-            msg = f"Не разобрал Drive ID: {url}"
+        if not file_id or file_id.startswith("folders"):
+            msg = f"Не разобрал Drive FILE id (нужен /file/d/…): {url}"
             print(f"[AutoDownloader] {msg}")
             errors.append(f"{filename}: {msg}")
             continue
