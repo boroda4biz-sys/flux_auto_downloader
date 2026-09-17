@@ -59,21 +59,24 @@ def _is_real_file(path: str) -> bool:
         size = os.path.getsize(path)
         if size <= _MIN_REAL_BYTES:
             return False
-        # LoRA/Flux обычно мегабайты; Drive virus-page HTML — килобайты текста
+        # LoRA стиля/персонажа почти всегда > 1 МБ; Drive HTML / confirm — килобайты
+        if path.endswith(".safetensors") and size < 1_000_000:
+            return False
         with open(path, "rb") as f:
             head = f.read(64)
         if not head:
             return False
-        # HTML / JSON error pages
         low = head.lstrip()[:20].lower()
-        if low.startswith(b"<!") or low.startswith(b"<html") or low.startswith(b"{") or low.startswith(b"<!doctype"):
+        if low.startswith(b"<!") or low.startswith(b"<html") or low.startswith(b"<!doctype"):
             return False
-        # safetensors: 8-byte little-endian header length
+        # safetensors: 8-byte little-endian header length, then JSON starting with '{'
         if path.endswith(".safetensors") and size > 8:
             import struct
 
             (hlen,) = struct.unpack("<Q", head[:8])
             if hlen <= 0 or hlen > size - 8 or hlen > 100_000_000:
+                return False
+            if len(head) > 8 and head[8:9] != b"{":
                 return False
         return True
     except OSError:
