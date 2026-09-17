@@ -337,10 +337,21 @@ def download_loras_from_list(gdrive_loras_list: str) -> dict:
         rc = os.system(cmd)
         if rc != 0 or not _is_real_file(target_path):
             print(f"[AutoDownloader] WARN: скачивание LoRA не подтверждено: {filename}")
-            if os.path.isfile(target_path) and not _is_real_file(target_path):
-                _remove_bad_file(target_path, "failed download / HTML")
-            errors.append(f"{filename}: download failed")
-            _ensure_placeholder(target_path)
+            if os.path.isfile(target_path):
+                # часто HTML «логин Google» ~0.5–2 МБ — не оставляем под LoraLoader
+                sniff = ""
+                try:
+                    with open(target_path, "rb") as f:
+                        sniff = f.read(40).lstrip()[:20].lower().decode("latin-1", "ignore")
+                except OSError:
+                    pass
+                why = "HTML/логин Drive" if sniff.startswith("<!") or sniff.startswith("<html") else "invalid"
+                _remove_bad_file(target_path, f"failed download / {why}")
+            errors.append(
+                f"{filename}: скачивание не дало настоящий .safetensors "
+                f"(проверь «доступ по ссылке» на файл, не папку; в инкогнито должно качаться без логина)"
+            )
+            # НЕ ставим placeholder — иначе LoraLoader → JSONDecodeError
         else:
             downloaded.append(filename)
 
@@ -372,6 +383,46 @@ _BASE_DOWNLOAD_STATE: dict = {
     "running": False,
     "last": None,
 }
+
+
+def loras_status(filenames: list[str] | None = None) -> dict:
+    """Готовность LoRA на диске (для poll / gate перед кадрами)."""
+    models_root = _models_root()
+    loras_dir = os.path.join(models_root, "loras")
+    names = [str(x).strip() for x in (filenames or []) if str(x).strip()]
+    if not names and os.path.isdir(loras_dir):
+        names = sorted(
+            f for f in os.listdir(loras_dir) if f.endswith((".safetensors", ".pt"))
+        )
+    files = []
+    ready = 0
+    for name in names:
+        path = os.path.join(loras_dir, os.path.basename(name))
+        size = 0
+        exists = os.path.isfile(path)
+        if exists:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+        is_real = _is_real_file(path)
+        if is_real:
+            ready += 1
+        files.append(
+            {
+                "file": os.path.basename(name),
+                "exists": exists,
+                "bytes": size,
+                "ready": is_real,
+            }
+        )
+    return {
+        "ok": bool(names) and ready == len(names),
+        "ready": ready,
+        "total": len(names),
+        "files": files,
+        "loras_dir": loras_dir,
+    }
 
 
 def base_models_status() -> dict:
@@ -484,6 +535,12 @@ def _register_http_routes() -> None:
     async def download_base_status_handler(_request):
         return web.json_response(base_models_status())
 
+    @routes.get("/flux_auto_downloader/loras_status")
+    async def loras_status_handler(request):
+        files_q = request.rel_url.query.get("files") or ""
+        names = [p.strip() for p in files_q.split(",") if p.strip()]
+        return web.json_response(loras_status(names or None))
+
     @routes.post("/flux_auto_downloader/download_loras")
     async def download_loras_handler(request):
         try:
@@ -500,7 +557,7 @@ def _register_http_routes() -> None:
         "[AutoDownloader] HTTP: "
         "POST /flux_auto_downloader/ensure_placeholders | "
         "download_base | download_loras | "
-        "GET download_base_status"
+        "GET download_base_status | loras_status"
     )
 
 
